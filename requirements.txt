@@ -1,0 +1,4 @@
+biopython>=1.81
+primer3-py>=2.0.0
+pandas>=2.0
+requests>=2.31

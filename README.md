@@ -1,4 +1,4 @@
-# Primer Design Tool
+# VarPrimer: Primer Design Tool
 
 Design PCR primers from variant positions. Reads a CSV of genes and variant positions
 (genomic or cDNA), fetches exon structure from Ensembl using the **MANE Select** transcript,
@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python primer_design.py \
+python varprimer.py \
     --input  variants.csv \
     --output primers_output.csv \
     --email  your@email.com

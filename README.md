@@ -113,22 +113,6 @@ ACVR1_6F,TGGGCATTCTCTCATCATCCCA,61.2,50.0,496,chr2:157773816-157773837,ACVR1,6,.
 ACVR1_6R,ACTAACAGGCCACGTGTCCC,62.1,60.0,496,chr2:157774292-157774311,ACVR1,6,...
 ```
 
----
-
-## Verifying primers on Ensembl
-
-Use the `Primer_Coords` value to navigate directly to the primer on the Ensembl genome browser:
-
-1. Go to [ensembl.org](https://www.ensembl.org) and paste the coordinate (e.g. `chr2:157773816-157773837`) into the search box.
-2. The primer sequence will be present in that region.
-
-> ⚠️ **Minus-strand genes** (e.g. ACVR1): the forward primer in the CSV is on the chromosome
-> **plus strand**, but the gene is transcribed in the reverse direction. On Ensembl, the primer
-> appears as its **reverse complement** on the displayed sequence. Use
-> [UCSC BLAT](https://genome.ucsc.edu/cgi-bin/hgBlat) to search by sequence if needed.
-
----
-
 ## How exon numbers are assigned
 
 1. Ensembl is queried for all transcripts of the gene.

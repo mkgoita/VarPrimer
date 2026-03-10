@@ -1,5 +1,9 @@
 # VarPrimer: Primer Design Tool
 
+<p align="center">
+  <img src="varprimer_logo.png" alt="VarPrimer Logo" width="250"/>
+</p>
+
 Design PCR primers from variant positions. Reads a CSV of genes and variant positions
 (genomic or cDNA), fetches exon structure from Ensembl using the **MANE Select** transcript,
 retrieves genomic sequence from **Ensembl REST**, designs primers with **primer3** (or a

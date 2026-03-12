@@ -343,27 +343,64 @@ def fetch_sequence(chrom: str, start: int, end: int, build: str, email: str,
 def check_ucsc_insilico_pcr(fwd_seq: str, rev_seq: str, build: str = "hg38") -> int:
     """
     Submits primers to UCSC In-Silico PCR (hgPcr) and returns the number of expected amplicons.
+    Uses 'genome-test.gi.ucsc.edu' since it often avoids the Cloudflare blocks on the primary server.
     Returns 0 if no match or error, 1 if unique, >1 if there are off-target amplicons.
     Returns -1 if the query fails completely.
     """
-    url = f"https://genome.ucsc.edu/cgi-bin/hgPcr?org=Human&db={build}&wp_target=genome&wp_f={fwd_seq}&wp_r={rev_seq}&Submit=submit"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    import subprocess
+    import bs4
+    
+    # We use 'genome-test' mirror which is typically more accessible for the CGI tools
+    # We still use 'Submit=Submit' (capital S) as it is standard for hgPcr
+    url_base = f"https://genome-test.gi.ucsc.edu/cgi-bin/hgPcr?db={build}"
+    url_params = (
+        f"&wp_target=genome&wp_f={fwd_seq}&wp_r={rev_seq}"
+        f"&Submit=Submit&wp_size=4000&wp_perfect=15&wp_good=15"
+        f"&boolshad.wp_flipReverse=0&wp_append=on&boolshad.wp_append=0"
+    )
+    
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode('utf-8')
+        # Using curl with a generic browser User-Agent
+        cmd = ["curl", "-s", "-L", "-A", "Mozilla/5.0", url_base + url_params]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        html = result.stdout
+        
+        # Check for Turnstile/Cloudflare challenge specifically
+        # Challenge pages are short and contain specific script markers
+        is_blocked = len(html) < 2000 and ('turnstile' in html.lower() or 'cf-browser-verification' in html.lower())
+        
+        if not html or is_blocked:
+            # Fallback to primary server if mirror is down or blocked
+            url_fallback = f"https://genome.ucsc.edu/cgi-bin/hgPcr?db={build}" + url_params
+            cmd[-1] = url_fallback
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            html = result.stdout
+            is_blocked = len(html) < 2000 and ('turnstile' in html.lower() or 'cf-browser-verification' in html.lower())
             
-            # UCSC returns a <PRE> or <pre> block for hits
-            if '<PRE>' in html or '<pre>' in html:
-                pre_block = html.split('<PRE>')[1].split('</PRE>')[0] if '<PRE>' in html else html.split('<pre>')[1].split('</pre>')[0]
-                # Each hit typically starts with ><A HREF="..."
-                return pre_block.count('><A HREF=')
-            
-            # If "No matches" is returned, amplicons = 0
-            if 'No matches to' in html:
-                return 0
-                
-            # If we couldn't parse it but no error was thrown
+        if not html or is_blocked:
+            log.warning("UCSC: Blocked by Cloudflare on both primary and mirror.")
+            return -1
+
+        # If "No matches" is returned, amplicons = 0
+        if 'No matches to' in html:
             return 0
+            
+        soup = bs4.BeautifulSoup(html, 'html.parser')
+        pre_tags = soup.find_all(['pre', 'PRE'])
+            
+        if pre_tags:
+            # Each hit is an anchor link within the PRE block
+            hits = pre_tags[0].find_all('a')
+            if hits:
+                return len(hits)
+            
+            # Fallback: Count lines starting with '>' in the PRE block
+            text = pre_tags[0].get_text()
+            lines = [l for l in text.split('\n') if l.strip().startswith('>')]
+            if lines:
+                return len(lines)
+            
+        return 0
     except Exception as exc:
         log.warning("UCSC In-Silico PCR check failed: %s", exc)
         return -1
@@ -386,10 +423,10 @@ def design_primers_primer3(
     primer_len_min: int = 18,
     primer_len_opt: int = 20,
     primer_len_max: int = 25,
-) -> Optional[Dict]:
+) -> List[Dict]:
     """
-    Use primer3-py to design a primer pair.
-    Returns dict with left/right sequences, TMs, GCs, product size; or None.
+    Use primer3-py to design primer pairs.
+    Returns a list of dicts (up to 5) with left/right sequences, TMs, GCs, product size.
     """
     result = primer3.design_primers(
         seq_args={
@@ -412,6 +449,7 @@ def design_primers_primer3(
         },
     )
 
+    pairs = []
     for i in range(5):
         key_l = f"PRIMER_LEFT_{i}_SEQUENCE"
         key_r = f"PRIMER_RIGHT_{i}_SEQUENCE"
@@ -421,7 +459,7 @@ def design_primers_primer3(
             prod_size = result.get(f"PRIMER_PAIR_{i}_PRODUCT_SIZE", 0)
             left_pos  = result.get(f"PRIMER_LEFT_{i}",  [0, 0])   # [start, length]
             right_pos = result.get(f"PRIMER_RIGHT_{i}", [0, 0])   # [3'-end, length]
-            return {
+            pairs.append({
                 "left_seq":    left_seq,
                 "right_seq":   right_seq,
                 "left_tm":     round(result.get(f"PRIMER_LEFT_{i}_TM",  tm_basic(left_seq)), 1),
@@ -434,8 +472,8 @@ def design_primers_primer3(
                 "left_end":    left_pos[0] + left_pos[1] - 1,
                 "right_end":   right_pos[0],                          # 3'-end (rightmost)
                 "right_start": right_pos[0] - right_pos[1] + 1,      # 5'-end of rev primer
-            }
-    return None
+            })
+    return pairs
 
 
 def design_primers_builtin(
@@ -448,11 +486,12 @@ def design_primers_builtin(
     gc_max: float = 65.0,
     primer_len_min: int = 18,
     primer_len_max: int = 25,
-) -> Optional[Dict]:
+) -> List[Dict]:
     """
     Pure-Python greedy primer picker.
     Slides a window on the left of the target and looks for a complementary
     window on the right that meets TM / GC / product-size constraints.
+    Returns a list of candidate pairs sorted by score (TM distance from 62 °C).
     """
     min_prod, max_prod = product_size_range
 
@@ -461,8 +500,7 @@ def design_primers_builtin(
         gc  = gc_percent(seq)
         return (tm_min <= tm <= tm_max) and (gc_min <= gc <= gc_max)
 
-    best = None
-    best_score = float("inf")
+    candidates = []
 
     for fwd_end in range(primer_len_min - 1, min(target_offset, len(sequence))):
         for fwd_start in range(max(0, fwd_end - primer_len_max + 1), fwd_end - primer_len_min + 2):
@@ -493,30 +531,34 @@ def design_primers_builtin(
 
                     # Score: distance of both TMs from 62 °C
                     score = abs(tm_basic(fwd_seq) - 62) + abs(tm_basic(rev_seq) - 62)
-                    if score < best_score:
-                        best_score = score
-                        best = {
-                            "left_seq":    fwd_seq,
-                            "right_seq":   rev_seq,
-                            "left_tm":     tm_basic(fwd_seq),
-                            "right_tm":    tm_basic(rev_seq),
-                            "left_gc":     gc_percent(fwd_seq),
-                            "right_gc":    gc_percent(rev_seq),
-                            "product_size": prod,
-                            # Offsets within the sequence window (0-based)
-                            "left_start":  fwd_start,
-                            "left_end":    fwd_end,
-                            "right_start": rev_start,
-                            "right_end":   rev_end,
-                        }
-    return best
+                    candidates.append((score, {
+                        "left_seq":    fwd_seq,
+                        "right_seq":   rev_seq,
+                        "left_tm":     tm_basic(fwd_seq),
+                        "right_tm":    tm_basic(rev_seq),
+                        "left_gc":     gc_percent(fwd_seq),
+                        "right_gc":    gc_percent(rev_seq),
+                        "product_size": prod,
+                        "left_start":  fwd_start,
+                        "left_end":    fwd_end,
+                        "right_start": rev_start,
+                        "right_end":   rev_end,
+                    }))
+                    
+                    # Keep only the top 10 candidates to save memory
+                    if len(candidates) > 50:
+                        candidates.sort(key=lambda x: x[0])
+                        candidates = candidates[:10]
+
+    candidates.sort(key=lambda x: x[0])
+    return [c[1] for c in candidates[:10]]
 
 
 def design_primers(
     sequence: str,
     target_offset: int,
     **kwargs,
-) -> Optional[Dict]:
+) -> List[Dict]:
     """Dispatch to primer3-py or built-in picker."""
     if HAS_PRIMER3:
         return design_primers_primer3(sequence, target_offset, **kwargs)
@@ -642,28 +684,26 @@ def parse_position(pos_str: str) -> Tuple[str, int]:
 def process_variant(
     gene: str,
     position_str: str,
-    build: str,
-    email: str,
-    api_key: Optional[str],
-    flank: int,
-    product_size_range: Tuple[int, int],
-    tm_min: float,
-    tm_opt: float,
-    tm_max: float,
-    gc_min: float,
-    gc_max: float,
-    user_transcript: str = "",        # NM_ or ENST ID: used only for cDNA→genomic conversion
-    cdna_label_override: str = "",    # pre-resolved cDNA label to show in output (skips conversion)
-) -> List[Dict]:
+    build: str = "hg38",
+    email: str = "",
+    api_key: Optional[str] = None,
+    flank: int = 400,
+    product_size_range: Tuple[int, int] = (100, 500),
+    tm_min: float = 57.0,
+    tm_opt: float = 62.0,
+    tm_max: float = 67.0,
+    gc_min: float = 40.0,
+    gc_max: float = 65.0,
+    user_transcript: str = "",
+    cdna_label_override: str = "",
+) -> Tuple[List[Dict], str]:
     """
-    Complete pipeline for a single (gene, position) pair.
-    position_str can be genomic (chr2:157774114) or cDNA (c.617G>A).
-    When cdna_label_override is set, position_str must be genomic — the
-    label is used purely for the output column, no conversion is performed.
-    Returns a list of two row dicts (forward + reverse primer).
+    Main workflow for a single variant.
+    Returns (rows, skip_reason). rows is a list of primer dicts, skip_reason is empty if successful.
     """
     gene          = gene.strip().upper()
     pos_input     = position_str.strip()
+    skip_reason   = ""
     # If a cDNA label was pre-supplied (both columns were filled in the CSV),
     # we skip cDNA→genomic conversion and use the label purely for output.
     cdna_label    = cdna_label_override.strip()
@@ -684,8 +724,9 @@ def process_variant(
         try:
             chrom, var_pos = parse_position(pos_input)
         except ValueError as exc:
-            log.error("Position parse error for %s: %s", gene, exc)
-            return []
+            reason = f"Position parse error: {exc}"
+            log.error("%s for %s", reason, gene)
+            return [], reason
         log.info("Processing %s @ %s:%d (genomic; cDNA label=%s, build=%s)",
                  gene, chrom, var_pos, cdna_label, build)
     elif is_cdna_position(pos_input):
@@ -696,16 +737,18 @@ def process_variant(
         # Priority: user-supplied transcript > MANE Select
         mapping_transcript = user_transcript.strip() if user_transcript.strip() else transcript_id
         if not mapping_transcript:
-            log.error("Cannot convert cDNA position for %s: no transcript found.", gene)
-            return []
+            reason = "Cannot convert cDNA position: no transcript found"
+            log.error("%s for %s", reason, gene)
+            return [], reason
         if user_transcript.strip():
             log.info("Using user-specified transcript for cDNA mapping: %s", mapping_transcript)
         try:
             chrom, gen_start, _gen_end = cdna_to_genomic(mapping_transcript, cdna_num, build)
             var_pos = gen_start
         except Exception as exc:
-            log.error("cDNA→genomic conversion failed for %s %s: %s", gene, pos_input, exc)
-            return []
+            reason = f"cDNA→genomic conversion failed: {exc}"
+            log.error("%s for %s %s", reason, gene, pos_input)
+            return [], reason
         log.info("Processing %s @ %s (cDNA %s → chr%s:%d, build=%s)",
                  gene, pos_input, pos_input, chrom, var_pos, build)
     else:
@@ -713,8 +756,9 @@ def process_variant(
         try:
             chrom, var_pos = parse_position(pos_input)
         except ValueError as exc:
-            log.error("Position parse error for %s: %s", gene, exc)
-            return []
+            reason = f"Position parse error: {exc}"
+            log.error("%s for %s", reason, gene)
+            return [], reason
         log.info("Processing %s @ %s:%d (build=%s)", gene, chrom, var_pos, build)
 
     # ── 3. Determine exon number ────────────────────────────────────────────────
@@ -726,13 +770,14 @@ def process_variant(
     try:
         sequence = fetch_sequence(chrom, seq_start, seq_end, build, email, api_key)
     except Exception as exc:
-        log.error("Failed to fetch sequence for %s %s: %s", gene, pos_input, exc)
-        return []
+        reason = f"Failed to fetch sequence: {exc}"
+        log.error("%s for %s %s", reason, gene, pos_input)
+        return [], reason
 
     target_offset = var_pos - seq_start    # 0-based offset of variant inside window
 
     # ── 5. Design primers ──────────────────────────────────────────────────────
-    pair = design_primers(
+    candidates = design_primers(
         sequence           = sequence,
         target_offset      = target_offset,
         product_size_range = product_size_range,
@@ -743,13 +788,36 @@ def process_variant(
         gc_max  = gc_max,
     )
 
-    if pair is None:
-        log.warning("No primers found for %s @ %s.", gene, pos_input)
-        return []
+    if not candidates:
+        reason = "No primer candidates found meeting basic criteria (Tm/GC/Size)"
+        log.warning("%s for %s @ %s.", reason, gene, pos_input)
+        return [], reason
 
-    # ── 6. Validation (In-Silico PCR) ──────────────────────────────────────────
-    amplicons = check_ucsc_insilico_pcr(pair["left_seq"], pair["right_seq"], build)
+    # ── 6. Validation (In-Silico PCR) Loop ─────────────────────────────────────
+    # We test candidates until we find one that is unique (1 amplicon total)
+    pair = None
+    amplicons = 0
     
+    for i, cand in enumerate(candidates):
+        log.info("Checking candidate %d/%d for uniqueness...", i + 1, len(candidates))
+        amps = check_ucsc_insilico_pcr(cand["left_seq"], cand["right_seq"], build)
+        if amps == 1:
+            log.info("Candidate %d is unique! Selecting this pair.", i + 1)
+            pair = cand
+            amplicons = amps
+            break
+        elif amps > 1:
+            log.info("Candidate %d is non-unique (%d amplicons).", i + 1, amps)
+        elif amps == 0:
+            log.info("Candidate %d returned no hits (check primer mapping).", i + 1)
+        else:
+            log.info("Candidate %d check failed.", i + 1)
+
+    if pair is None:
+        reason = f"No unique primer pair found among {len(candidates)} candidates"
+        log.warning("%s for %s @ %s. Skipping variant.", reason, gene, pos_input)
+        return [], reason
+
     # ── 7. Build output rows ───────────────────────────────────────────────────
     exon_label = exon_num if exon_num != "?" else "1"
     fwd_name   = f"{gene}_{exon_label}F"
@@ -784,7 +852,7 @@ def process_variant(
          "TM": pair["right_tm"], "GC_percent": pair["right_gc"],
          "Primer_Coords": rev_coords, **base_row},
     ]
-    return rows
+    return rows, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,13 +917,13 @@ def main():
                  "(e.g. c.617G>A) and/or a 'position' column (e.g. chr2:157774114).")
 
     all_rows = []
+    skipped_variants = []
     n_total  = len(df_input)
 
     for idx, row in df_input.iterrows():
         gene = str(row["gene"]).strip()
 
         # ── Determine which position to use ─────────────────────────────────
-        # cdna_position column takes priority over position (genomic) column.
         def _col(name: str) -> str:
             val = str(row.get(name, "")).strip()
             return "" if val.lower() in ("", "nan", "none") else val
@@ -865,25 +933,19 @@ def main():
         user_tx      = _col("transcript") if "transcript" in df_input.columns else ""
 
         if cdna_pos_raw and geom_pos_raw:
-            # Both columns filled → genomic position is ground truth;
-            # cDNA notation is carried as a label only (no conversion).
             position          = geom_pos_raw
             cdna_label_arg    = cdna_pos_raw
-            log.info("Both position and cdna_position supplied for %s — using genomic position %s "
-                     "(cDNA label: %s)", gene, geom_pos_raw, cdna_pos_raw)
         elif cdna_pos_raw:
-            # Only cDNA provided — perform conversion
             position       = cdna_pos_raw
             cdna_label_arg = ""
         else:
-            # Only genomic provided
             position       = geom_pos_raw
             cdna_label_arg = ""
 
         log.info("── Variant %d/%d: %s %s ──", idx + 1, n_total, gene, position)
 
         try:
-            rows = process_variant(
+            rows, reason = process_variant(
                 gene                = gene,
                 position_str        = position,
                 build               = args.build,
@@ -899,11 +961,21 @@ def main():
                 user_transcript     = user_tx,
                 cdna_label_override = cdna_label_arg,
             )
+            if not rows and reason:
+                skipped_variants.append({
+                    "Gene": gene,
+                    "Target_Position": position,
+                    "Skip_Reason": reason
+                })
+            else:
+                all_rows.extend(rows)
         except Exception as exc:
             log.error("Unexpected error for %s %s: %s", gene, position, exc)
-            rows = []
-
-        all_rows.extend(rows)
+            skipped_variants.append({
+                "Gene": gene, 
+                "Target_Position": position, 
+                "Skip_Reason": f"Crash: {exc}"
+            })
 
     # Write output CSV
     if all_rows:
@@ -916,8 +988,17 @@ def main():
         log.info("Saved %d primer records to %s", len(all_rows), args.output)
         print(f"\nDone! Primers written to: {args.output}")
     else:
-        log.warning("No primers were designed. Output file not written.")
+        log.warning("No primers were designed.")
         print("\nNo primers were designed. Check warnings above.")
+
+    # Write skipped variants CSV
+    if skipped_variants:
+        skipped_file = args.output.replace(".csv", "_skipped.csv")
+        if not skipped_file.endswith("_skipped.csv"):
+            skipped_file += "_skipped.csv"
+        pd.DataFrame(skipped_variants).to_csv(skipped_file, index=False)
+        log.info("Saved %d skipped variants to %s", len(skipped_variants), skipped_file)
+        print(f"Skipped variants recorded in: {skipped_file}")
 
 
 if __name__ == "__main__":
